@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>One Direction & Solos - Chronological Animated Globe</title>
+    
+    <!-- Import Globe.gl and PapaParse via CDN -->
+    <script src="//unpkg.com/globe.gl"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            overflow: hidden;
+            font-family: sans-serif;
+        }
+        #globeViz {
+            width: 100vw;
+            height: 100vh;
+        }
+        #info-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.75);
+            padding: 15px 20px;
+            border-radius: 8px;
+            pointer-events: auto;
+            max-width: 300px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            z-index: 10;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin-top: 8px;
+            font-size: 13px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .legend-item input[type="checkbox"] {
+            margin-right: 8px;
+            cursor: pointer;
+            accent-color: #fff;
+        }
+        .color-box {
+            width: 14px;
+            height: 14px;
+            margin-right: 10px;
+            border-radius: 3px;
+            display: inline-block;
+            flex-shrink: 0;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="info-panel">
+        <h3 style="margin-top:0; margin-bottom:10px;">More than One Direction</h3>
+        <div id="legend"></div>
+    </div>
+
+    <div id="globeViz"></div>
+
+    <script>
+        // Camera focal state tracking
+        let currentAltitude = 2.5;
+        let currentCenter = { lat: 0, lng: 0 };
+
+        // Global storage for filtering
+        let allPoints = [];
+        let allArcs = [];
+        let activeArtists = new Set();
+
+        // Globe initialization
+        const world = Globe()
+            (document.getElementById('globeViz'))
+            .globeImageUrl('//unpkg.com/three-globe/example/img/earth-night.jpg')
+            .backgroundImageUrl('//unpkg.com/three-globe/example/img/night-sky.png')
+            
+            .showAtmosphere(true)
+            .atmosphereColor('#1b4332')
+            .atmosphereAltitude(0.08)
+            
+            // --- POINTS CONFIGURATION ---
+            .pointLat(d => Number(d.lat_adjusted))
+            .pointLng(d => Number(d.lng_adjusted))
+            .pointAltitude(0.005)
+            .pointColor(d => d.color || '#FFFFFF')
+            .pointRadius(d => Math.max(0.02, 0.15 * Math.min(1, currentAltitude / 2.5)))
+            .pointLabel(d => `
+                <div style="background: rgba(10, 10, 15, 0.95); padding: 10px 14px; border-radius: 6px; color: white; border: 1px solid ${d.color || '#FFFFFF'}; font-family: sans-serif; pointer-events: none;">
+                    <b style="color: ${d.color || '#FFFFFF'}; font-size: 14px;">${d.artist}</b><br/>
+                    <span style="font-size: 12px; color: #ddd;">
+                        <b>City:</b> ${d.city || 'Unknown'}${d.country ? `, ${d.country}` : ''}<br/>
+                        <b>Date:</b> ${d.event_date || 'Unknown date'}<br/>
+                        <b>Venue:</b> ${d.venue || 'Unknown venue'}
+                    </span>
+                </div>
+            `)
+
+            // --- ARCS CONFIGURATION (Distance-proportional height & 3D repulsion on zoom) ---
+            .arcStartLat(d => d.startLat)
+            .arcStartLng(d => d.startLng)
+            .arcEndLat(d => d.endLat)
+            .arcEndLng(d => d.endLng)
+            .arcColor(d => [d.colorStart, d.colorEnd])
+            
+            // Dynamic altitude: arcs lift up and spread out when zoomed into their area
+            .arcAltitude(d => {
+                const baseAlt = d.baseAltitude;
+                if (currentAltitude > 1.8) return baseAlt;
+
+                const midLat = (d.startLat + d.endLat) / 2;
+                const midLng = (d.startLng + d.endLng) / 2;
+                const distToCenter = getDistanceKm(currentCenter.lat, currentCenter.lng, midLat, midLng);
+
+                const zoomFactor = (1.8 - Math.max(0.2, currentAltitude)) / 1.6; 
+                const proximityFactor = Math.max(0, 1 - (distToCenter / 2500));
+
+                const spreadOffset = ((d.groupOrder % 4) + 1) * 0.04 * proximityFactor * zoomFactor;
+
+                return baseAlt + spreadOffset;
+            })
+            
+            .arcStroke(d => Math.max(0.02, 0.4 * Math.min(1, currentAltitude / 2.5)))
+            .arcDashLength(1)
+            .arcDashGap(d => d.dashGap)
+            .arcDashInitialGap(d => d.dashInitialGap);
+
+        // --- CAMERA CONTROLS LISTENER ---
+        world.controls().addEventListener('change', () => {
+            const pov = world.pointOfView();
+            currentAltitude = pov.altitude;
+            currentCenter = { lat: pov.lat, lng: pov.lng };
+
+            world.arcAltitude(world.arcAltitude());
+            world.arcStroke(world.arcStroke());
+            world.pointRadius(world.pointRadius());
+        });
+
+        // Filter and update displayed points & arcs based on checked artists
+        function updateVisibility() {
+            const filteredPoints = allPoints.filter(p => activeArtists.has(p.artist || 'Unknown'));
+            const filteredArcs = allArcs.filter(a => activeArtists.has(a.artist || 'Unknown'));
+
+            world.pointsData(filteredPoints);
+            world.arcsData(filteredArcs);
+        }
+
+        // Load CSV file
+        Papa.parse('all_one_direction_tours_map_data.csv', {
+            download: true,
+            header: true,
+            dynamicTyping: true,
+            skipEmptyLines: true,
+            complete: function(results) {
+                const data = results.data;
+
+                // 1. Filter out invalid coordinates
+                const validPoints = data.filter(d => 
+                    d && 
+                    !isNaN(parseFloat(d.latitude)) && 
+                    !isNaN(parseFloat(d.longitude))
+                );
+
+                // 2. Circle arrangement for concerts sharing the exact same location
+                const groups = {};
+                validPoints.forEach(d => {
+                    const lat = parseFloat(d.latitude);
+                    const lng = parseFloat(d.longitude);
+                    const key = `${lat.toFixed(2)}_${lng.toFixed(2)}`;
+
+                    if (!groups[key]) groups[key] = [];
+                    groups[key].push({ ...d, lat, lng });
+                });
+
+                const processedPoints = [];
+                const radiusOffset = 0.5;
+
+                Object.values(groups).forEach(group => {
+                    const total = group.length;
+                    group.forEach((point, index) => {
+                        if (index === 0) {
+                            processedPoints.push({
+                                ...point,
+                                lat_adjusted: point.lat,
+                                lng_adjusted: point.lng
+                            });
+                        } else {
+                            const circleIndex = index - 1;
+                            const circleTotal = total - 1;
+                            const angle = (circleIndex / circleTotal) * (2 * Math.PI);
+
+                            processedPoints.push({
+                                ...point,
+                                lat_adjusted: point.lat + radiusOffset * Math.sin(angle),
+                                lng_adjusted: point.lng + radiusOffset * Math.cos(angle)
+                            });
+                        }
+                    });
+                });
+
+                // Store all points & enable all artists by default
+                allPoints = processedPoints;
+                allPoints.forEach(p => activeArtists.add(p.artist || 'Unknown'));
+
+                // 3. Generate sequential arcs chronologically
+                allArcs = createSequentialArcs(allPoints);
+
+                // 4. Initial rendering
+                renderLegendFromData(allPoints);
+                updateVisibility();
+
+                // 5. Start one-time sequential animation
+                animateArcsSequence(allArcs);
+            }
+        });
+
+        // Haversine formula (calculate distance in kilometers)
+        function getDistanceKm(lat1, lon1, lat2, lon2) {
+            const R = 6371;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = 
+                Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c;
+        }
+
+        function createSequentialArcs(points) {
+            const arcs = [];
+
+            const artistGroups = {};
+            points.forEach(p => {
+                const artist = p.artist || 'Unknown';
+                if (!artistGroups[artist]) artistGroups[artist] = [];
+                artistGroups[artist].push(p);
+            });
+
+            const oneDirectionName = Object.keys(artistGroups).find(name => name.toLowerCase().includes('one direction')) || 'One Direction';
+            const soloArtists = Object.keys(artistGroups).filter(name => name !== oneDirectionName);
+
+            // Generate arcs for One Direction
+            if (artistGroups[oneDirectionName]) {
+                buildArcsForGroup(artistGroups[oneDirectionName], arcs, '1D', oneDirectionName);
+            }
+
+            // Generate arcs for Solo artists
+            soloArtists.forEach(artist => {
+                buildArcsForGroup(artistGroups[artist], arcs, 'SOLO', artist);
+            });
+
+            return arcs;
+        }
+
+        function buildArcsForGroup(list, arcsArray, phase, artistName) {
+            list.sort((a, b) => new Date(a.event_date) - new Date(b.event_date));
+            const count = list.length;
+            if (count < 2) return;
+
+            for (let i = 0; i < count - 1; i++) {
+                const p1 = list[i];
+                const p2 = list[i + 1];
+
+                const progressStart = i / (count - 1);
+                const progressEnd = (i + 1) / (count - 1);
+
+                const baseColor = p1.color || '#3a86ff';
+
+                // Calculate true distance between concerts in km
+                const distanceKm = getDistanceKm(p1.lat_adjusted, p1.lng_adjusted, p2.lat_adjusted, p2.lng_adjusted);
+                
+                // Strongly proportional altitude:
+                // - Very low base (0.012) so short trips (e.g. Manchester -> London) stay close to the ground
+                // - Higher multiplier (0.000065) so intercontinental flights (e.g. Paris -> NYC) arch high above
+                // - Tiny jitter ((i % 4) * 0.004) to prevent identical overlapping routes
+                const calculatedAltitude = 0.012 + (distanceKm * 0.000065) + ((i % 4) * 0.004);
+
+                arcsArray.push({
+                    artist: artistName,
+                    phase: phase,
+                    groupOrder: i,
+                    groupTotal: count - 1,
+                    startLat: p1.lat_adjusted,
+                    startLng: p1.lng_adjusted,
+                    endLat: p2.lat_adjusted,
+                    endLng: p2.lng_adjusted,
+                    colorStart: adjustLightness(baseColor, progressStart),
+                    colorEnd: adjustLightness(baseColor, progressEnd),
+                    baseAltitude: Math.min(0.45, calculatedAltitude),
+                    altitude: Math.min(0.45, calculatedAltitude),
+                    dashGap: 1,
+                    dashInitialGap: 1
+                });
+            }
+        }
+
+        // Continuous sequential animation (arc by arc)
+        function animateArcsSequence(arcs) {
+            const duration1D = 10000;   // 10 seconds for One Direction
+            const durationSolo = 15000; // 15 seconds for Solo artists
+            
+            const startTime = performance.now();
+
+            function step(now) {
+                const elapsed = now - startTime;
+
+                if (elapsed <= duration1D) {
+                    const progress1D = elapsed / duration1D;
+
+                    arcs.forEach(arc => {
+                        if (arc.phase === '1D') {
+                            const arcStartProgress = arc.groupOrder / arc.groupTotal;
+                            const arcEndProgress = (arc.groupOrder + 1) / arc.groupTotal;
+
+                            if (progress1D >= arcEndProgress) {
+                                arc.dashGap = 0;
+                                arc.dashInitialGap = 0;
+                            } else if (progress1D <= arcStartProgress) {
+                                arc.dashGap = 1;
+                                arc.dashInitialGap = 1;
+                            } else {
+                                const localProgress = (progress1D - arcStartProgress) / (arcEndProgress - arcStartProgress);
+                                arc.dashGap = 0;
+                                arc.dashInitialGap = 1 - localProgress;
+                            }
+                        }
+                    });
+                } 
+                else if (elapsed <= duration1D + durationSolo) {
+                    const progressSolo = (elapsed - duration1D) / durationSolo;
+
+                    arcs.forEach(arc => {
+                        if (arc.phase === '1D') {
+                            arc.dashGap = 0;
+                            arc.dashInitialGap = 0;
+                        } else if (arc.phase === 'SOLO') {
+                            const arcStartProgress = arc.groupOrder / arc.groupTotal;
+                            const arcEndProgress = (arc.groupOrder + 1) / arc.groupTotal;
+
+                            if (progressSolo >= arcEndProgress) {
+                                arc.dashGap = 0;
+                                arc.dashInitialGap = 0;
+                            } else if (progressSolo <= arcStartProgress) {
+                                arc.dashGap = 1;
+                                arc.dashInitialGap = 1;
+                            } else {
+                                const localProgress = (progressSolo - arcStartProgress) / (arcEndProgress - arcStartProgress);
+                                arc.dashGap = 0;
+                                arc.dashInitialGap = 1 - localProgress;
+                            }
+                        }
+                    });
+                } 
+                else {
+                    arcs.forEach(arc => {
+                        arc.dashGap = 0;
+                        arc.dashInitialGap = 0;
+                    });
+                    updateVisibility();
+                    return;
+                }
+
+                updateVisibility();
+                requestAnimationFrame(step);
+            }
+
+            requestAnimationFrame(step);
+        }
+
+        // Utility to adjust HEX color lightness for time gradients
+        function adjustLightness(hex, ratio) {
+            let color = hex.replace('#', '');
+            if (color.length === 3) {
+                color = color.split('').map(c => c + c).join('');
+            }
+
+            let r = parseInt(color.substring(0, 2), 16);
+            let g = parseInt(color.substring(2, 4), 16);
+            let b = parseInt(color.substring(4, 6), 16);
+
+            const factor = 0.3 + (ratio * 1.1);
+
+            r = Math.min(255, Math.floor(r * factor));
+            g = Math.min(255, Math.floor(g * factor));
+            b = Math.min(255, Math.floor(b * factor));
+
+            return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
+        }
+
+        // Render interactive legend with checkboxes, color boxes, and artist names
+        function renderLegendFromData(data) {
+            const legendDiv = document.getElementById('legend');
+            legendDiv.innerHTML = '';
+            
+            const artistMap = new Map();
+            data.forEach(d => {
+                const artist = d.artist || 'Unknown';
+                if (d.color && !artistMap.has(artist)) {
+                    artistMap.set(artist, d.color);
+                }
+            });
+
+            artistMap.forEach((color, artist) => {
+                const label = document.createElement('label');
+                label.className = 'legend-item';
+
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.checked = true;
+                checkbox.addEventListener('change', () => {
+                    if (checkbox.checked) {
+                        activeArtists.add(artist);
+                    } else {
+                        activeArtists.delete(artist);
+                    }
+                    updateVisibility();
+                });
+
+                const colorBox = document.createElement('span');
+                colorBox.className = 'color-box';
+                colorBox.style.background = color;
+
+                const nameSpan = document.createElement('span');
+                nameSpan.textContent = artist;
+
+                label.appendChild(checkbox);
+                label.appendChild(colorBox);
+                label.appendChild(nameSpan);
+                legendDiv.appendChild(label);
+            });
+        }
+    </script>
+</body>
+</html>
